@@ -36,12 +36,17 @@ class AiCodeExecuter:
         self.api_key = None
         self.model = None
         self.chat_session = None
+        self.max_code_retries = 3  # Maximum number of times to retry executing code after errors
         self.system_prompt = (
             "You are an AI coding assistant. Your primary role is to help with programming tasks by "
             "providing concise, executable Python code solutions.\n"
             "When a user's request involves code:\n"
             "1. Provide the Python code solution formatted within ```python and ``` tags for automatic execution.\n"
             "2. Briefly explain what the code does after providing it.\n\n"
+            "File Processing:\n"
+            "- Users can upload files for you to analyze or process.\n"
+            "- When a file is uploaded, you'll receive it along with the user's instructions about what to do with it.\n"
+            "- Respond based on the content of the file and the user's instructions.\n\n"
             "For non-programming questions, respond as a helpful assistant.\n\n"
             "Limitations:\n"
             "- You cannot directly create, modify, or interact with files on the user's system (e.g., you "
@@ -160,9 +165,12 @@ class AiCodeExecuter:
                     dependencies.add(package_name)
         return list(dependencies)
 
-    def execute_code(self, code):
+    def execute_code(self, code, retry_count=0):
         """Execute the provided Python code and return the result"""
-        print(f"{Fore.CYAN}⚙️ Executing code...{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}⚙️ Executing code{' (retry #'+str(retry_count)+')' if retry_count > 0 else ''}...{Style.RESET_ALL}")
+        
+        # Define timeout in seconds
+        timeout_seconds = 60
         
         dependencies = self._extract_dependencies(code)
         if dependencies:
@@ -193,12 +201,13 @@ class AiCodeExecuter:
         
         output_str = ""
         try:
+            print(f"{Fore.YELLOW}Executing code with a {timeout_seconds} second timeout...{Style.RESET_ALL}")
             # Execute the code in a separate process for safety, using the venv python
             result = subprocess.run(
                 [self.venv_python_path, temp_file_path],
                 capture_output=True,
                 text=True,
-                timeout=60  # Set a timeout to prevent infinite loops
+                timeout=timeout_seconds  # Ensure timeout is applied
             )
             
             # Get the output
@@ -217,16 +226,33 @@ class AiCodeExecuter:
                 print(f"{Fore.RED}❌ Code execution failed!{Style.RESET_ALL}")
             
         except subprocess.TimeoutExpired:
-            output_str = "Error: Code execution timed out (>10 seconds)"
-            print(f"{Fore.RED}⏱️ Code execution timed out!{Style.RESET_ALL}")
+            output_str = f"Error: Code execution timed out (exceeded {timeout_seconds} seconds)"
+            print(f"{Fore.RED}⏱️ Code execution timed out after {timeout_seconds} seconds!{Style.RESET_ALL}")
+            
+            # Kill any remaining process (in case the timeout didn't fully terminate it)
+            try:
+                # Try to find and kill any runaway process
+                if os.name == 'nt':  # Windows
+                    subprocess.run(["taskkill", "/F", "/PID", str(result.pid)], 
+                                  capture_output=True, check=False)
+                else:  # Unix/Linux
+                    subprocess.run(["kill", "-9", str(result.pid)], 
+                                  capture_output=True, check=False)
+            except Exception:
+                # Ignore errors in the cleanup process
+                pass
+                
         except Exception as e:
             output_str = f"Error executing code: {str(e)}\n{traceback.format_exc()}"
             print(f"{Fore.RED}❌ Exception during code execution: {e}{Style.RESET_ALL}")
         finally:
             # Clean up: delete the temporary file
-            os.unlink(temp_file_path)
+            try:
+                os.unlink(temp_file_path)
+            except Exception:
+                print(f"{Fore.YELLOW}⚠️ Unable to delete temporary file: {temp_file_path}{Style.RESET_ALL}")
         
-        return output_str
+        return output_str, result.returncode if 'result' in locals() else -1
     
     def display_welcome(self):
         """Display a welcome message"""
@@ -237,12 +263,167 @@ class AiCodeExecuter:
 ║                                                          ║
 ║   - Ask any question or request code solutions           ║
 ║   - Python code will be automatically executed           ║
+║   - Type 'upload <filepath> with prompt <your prompt>'   ║
+║     to send a file to the AI with specific instructions  ║
 ║   - Type 'exit', 'quit', or 'bye' to end the session     ║
 ║   - Type 'clear' to clear the conversation history       ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
 """
         print(f"{Fore.CYAN}{welcome_text}{Style.RESET_ALL}")
+    
+    def _handle_file_upload(self, file_path, prompt=None):
+        """Uploads a file to the Gemini API with an optional prompt."""
+        try:
+            file_path = os.path.abspath(file_path)
+            if not os.path.exists(file_path):
+                print(f"{Fore.RED}❌ File not found: {file_path}{Style.RESET_ALL}")
+                return
+            
+            if not os.path.isfile(file_path):
+                print(f"{Fore.RED}❌ Path is not a file: {file_path}{Style.RESET_ALL}")
+                return
+
+            file_name = os.path.basename(file_path)
+            file_extension = os.path.splitext(file_name)[1].lower()
+            
+            print(f"{Fore.CYAN}Reading file: {file_path}...{Style.RESET_ALL}")
+            
+            # Determine MIME type based on file extension
+            mime_type = self._get_mime_type(file_extension)
+            
+            # Read the file based on its type
+            if mime_type.startswith('image/') or mime_type.startswith('application/'):
+                # Binary file (image, PDF, etc.)
+                with open(file_path, 'rb') as f:
+                    file_content = f.read()
+                
+                # Create a Gemini-compatible image part
+                if mime_type.startswith('image/'):
+                    file_part = {"mime_type": mime_type, "data": file_content}
+                else:
+                    # For other binary files, send as text if possible
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            file_content = f.read()
+                        # Send as text
+                        file_part = file_content
+                    except:
+                        print(f"{Fore.RED}❌ Cannot process binary file type: {mime_type}{Style.RESET_ALL}")
+                        return
+            else:
+                # Text file
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    file_content = f.read()
+                file_part = file_content
+            
+            # Prepare the message with the file content and prompt
+            if prompt:
+                user_message = f"I'm uploading a file named '{file_name}'. {prompt}"
+            else:
+                user_message = f"I'm uploading a file named '{file_name}'. Please analyze it and suggest what I can do with it."
+            
+            print(f"{Fore.YELLOW}Uploading file to AI with prompt: {prompt or 'No specific prompt'}{Style.RESET_ALL}")
+            
+            try:
+                # For multimodal file uploads like images
+                if isinstance(file_part, dict) and 'mime_type' in file_part:
+                    response = self.chat_session.send_message([user_message, file_part])
+                # For text content
+                else:
+                    file_message = f"{user_message}\n\nFile Content:\n```\n{file_part}\n```"
+                    response = self.chat_session.send_message(file_message)
+                    
+                response_text = response.text
+                
+                print(f"{Fore.BLUE}AI: {Style.RESET_ALL}{response_text}")
+                
+                # Check if the response contains executable code
+                code = self.extract_code(response_text)
+                if code:
+                    output, exit_code = self.execute_code(code)
+                    print(f"{Fore.MAGENTA}Code Output:{Style.RESET_ALL}\n{output}")
+                    
+                    # Handle error cases with retries (except for timeouts)
+                    retry_count = 3
+                    while exit_code != 0 and retry_count < self.max_code_retries and "timed out" not in output.lower():
+                        print(f"{Fore.YELLOW}Code execution failed. Asking AI to fix the error (retry {retry_count+1}/{self.max_code_retries})...{Style.RESET_ALL}")
+                        
+                        # Send error to AI and ask for a fix
+                        fix_request = (
+                            f"The code to process the file '{file_name}' failed with the following error:\n\n"
+                            f"{output}\n\n"
+                            f"Please fix the code and provide a corrected version. Make sure your solution handles the error case."
+                        )
+                        
+                        fix_response = self.chat_session.send_message(fix_request)
+                        fix_response_text = fix_response.text
+                        print(f"{Fore.BLUE}AI: {Style.RESET_ALL}{fix_response_text}")
+                        
+                        # Extract the fixed code
+                        fixed_code = self.extract_code(fix_response_text)
+                        if fixed_code:
+                            output, exit_code = self.execute_code(fixed_code, retry_count + 1)
+                            print(f"{Fore.MAGENTA}Code Output (Retry {retry_count+1}):{Style.RESET_ALL}\n{output}")
+                            retry_count += 1
+                        else:
+                            print(f"{Fore.RED}❌ AI didn't provide a fixed code block. Aborting retry attempts.{Style.RESET_ALL}")
+                            break
+                    
+                    # Final response after all execution attempts
+                    if exit_code == 0:
+                        result_message = (
+                            f"The code to process the uploaded file '{file_name}' has been executed successfully. "
+                            f"Here is the output:\n{output}\n"
+                            f"Is there anything you'd like to explain about these results or further actions to take?"
+                        )
+                    else:
+                        if "timed out" in output.lower():
+                            result_message = (
+                                f"The code to process the uploaded file '{file_name}' timed out. "
+                                f"This usually happens when the code has an infinite loop or takes too long to execute. "
+                                f"Could you explain what might have caused the timeout and how to avoid it?"
+                            )
+                        else:
+                            result_message = (
+                                f"After {retry_count} retry attempts, the code still failed to execute properly. "
+                                f"Final error:\n{output}\n"
+                                f"Could you explain what might be causing this persistent issue?"
+                            )
+                    
+                    followup = self.chat_session.send_message(result_message)
+                    print(f"{Fore.BLUE}AI: {Style.RESET_ALL}{followup.text}")
+                
+            except Exception as e:
+                print(f"{Fore.RED}❌ Error sending file to AI: {e}{Style.RESET_ALL}")
+                traceback.print_exc()
+                
+        except Exception as e:
+            print(f"{Fore.RED}❌ Error handling file upload: {e}{Style.RESET_ALL}")
+            traceback.print_exc()
+    
+    def _get_mime_type(self, extension):
+        """Determine MIME type based on file extension."""
+        mime_types = {
+            '.txt': 'text/plain',
+            '.py': 'text/x-python',
+            '.js': 'text/javascript',
+            '.html': 'text/html',
+            '.css': 'text/css',
+            '.json': 'application/json',
+            '.xml': 'application/xml',
+            '.csv': 'text/csv',
+            '.md': 'text/markdown',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.pdf': 'application/pdf',
+            '.doc': 'application/msword',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        }
+        return mime_types.get(extension, 'application/octet-stream')
     
     def run(self):
         """Run the interactive chat loop"""
@@ -273,6 +454,28 @@ class AiCodeExecuter:
                 print(f"{Fore.GREEN}✅ Chat history cleared and system prompt re-initialized.{Style.RESET_ALL}")
                 continue
             
+            # Check for upload command with optional prompt
+            if user_input.lower().startswith('upload '):
+                # Extract the file path and prompt
+                # Format: "upload <filepath> with prompt <your prompt>"
+                upload_parts = user_input[len('upload '):].strip()
+                
+                # Check if there's a "with prompt" part
+                if ' with prompt ' in upload_parts.lower():
+                    file_path, prompt = upload_parts.split(' with prompt ', 1)
+                    file_path = file_path.strip()
+                    prompt = prompt.strip()
+                else:
+                    # No prompt specified
+                    file_path = upload_parts
+                    prompt = None
+                
+                if file_path:
+                    self._handle_file_upload(file_path, prompt)
+                else:
+                    print(f"{Fore.YELLOW}⚠️ Please specify a file path. Usage: upload <filepath> [with prompt <your prompt>]{Style.RESET_ALL}")
+                continue
+            
             # Send message to Gemini AI
             try:
                 print(f"{Fore.YELLOW}AI thinking...{Style.RESET_ALL}")
@@ -286,14 +489,56 @@ class AiCodeExecuter:
                 code = self.extract_code(response_text)
                 if code:
                     # Execute the code and show the result
-                    output = self.execute_code(code)
+                    output, exit_code = self.execute_code(code)
                     print(f"{Fore.MAGENTA}Code Output:{Style.RESET_ALL}\n{output}")
                     
-                    # Send the execution result back to the AI
-                    followup = self.chat_session.send_message(
-                        f"The code has been executed. Here is the output:\n{output}\n"
-                        f"Is there anything you'd like to explain about these results?"
-                    )
+                    # Handle error cases with retries (except for timeouts)
+                    retry_count = 0
+                    while exit_code != 0 and retry_count < self.max_code_retries and "timed out" not in output.lower():
+                        print(f"{Fore.YELLOW}Code execution failed. Asking AI to fix the error (retry {retry_count+1}/{self.max_code_retries})...{Style.RESET_ALL}")
+                        
+                        # Send error to AI and ask for a fix
+                        fix_request = (
+                            f"The code failed with the following error:\n\n"
+                            f"{output}\n\n"
+                            f"Please fix the code and provide a corrected version. Make sure your solution handles the error case."
+                        )
+                        
+                        fix_response = self.chat_session.send_message(fix_request)
+                        fix_response_text = fix_response.text
+                        print(f"{Fore.BLUE}AI: {Style.RESET_ALL}{fix_response_text}")
+                        
+                        # Extract the fixed code
+                        fixed_code = self.extract_code(fix_response_text)
+                        if fixed_code:
+                            output, exit_code = self.execute_code(fixed_code, retry_count + 1)
+                            print(f"{Fore.MAGENTA}Code Output (Retry {retry_count+1}):{Style.RESET_ALL}\n{output}")
+                            retry_count += 1
+                        else:
+                            print(f"{Fore.RED}❌ AI didn't provide a fixed code block. Aborting retry attempts.{Style.RESET_ALL}")
+                            break
+                    
+                    # Final response after all execution attempts
+                    if exit_code == 0:
+                        result_message = (
+                            f"The code has been executed successfully. Here is the output:\n{output}\n"
+                            f"Is there anything you'd like to explain about these results?"
+                        )
+                    else:
+                        if "timed out" in output.lower():
+                            result_message = (
+                                f"The code execution timed out. "
+                                f"This usually happens when the code has an infinite loop or takes too long to execute. "
+                                f"Could you explain what might have caused the timeout and how to avoid it?"
+                            )
+                        else:
+                            result_message = (
+                                f"After {retry_count} retry attempts, the code still failed to execute properly. "
+                                f"Final error:\n{output}\n"
+                                f"Could you explain what might be causing this persistent issue?"
+                            )
+                    
+                    followup = self.chat_session.send_message(result_message)
                     print(f"{Fore.BLUE}AI: {Style.RESET_ALL}{followup.text}")
                 
             except Exception as e:
